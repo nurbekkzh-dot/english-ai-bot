@@ -1,0 +1,66 @@
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from database.db_users import get_user, add_xp, update_streak
+from services.ai_service import generate_ai_response
+
+router = APIRouter()
+
+# История чатов в памяти
+_chat_history: dict[int, list[dict]] = {}
+
+class ChatRequest(BaseModel):
+    user_id: int
+    message: str
+    file_context: str | None = None
+
+@router.post("/send")
+async def send_message(data: ChatRequest):
+    user = get_user(data.user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    level = user["english_level"] or "A1"
+    mode  = user["current_mode"]
+
+    history = _chat_history.get(data.user_id, [])[-20:]
+
+    try:
+        ai_reply = await generate_ai_response(
+            user_text=data.message,
+            level=level,
+            mode=mode,
+            history=history,
+            file_context=data.file_context,
+        )
+    except Exception as exc:
+        message = str(exc)
+        if "RESOURCE_EXHAUSTED" in message or "prepayment credits are depleted" in message:
+            raise HTTPException(
+                status_code=429,
+                detail="У Gemini API закончились credits/balance. Добавь баланс в AI Studio или вставь другой GEMINI_API_KEY.",
+            ) from exc
+        if "GEMINI_API_KEY" in message:
+            raise HTTPException(status_code=500, detail="GEMINI_API_KEY не настроен в backend/.env.") from exc
+        raise HTTPException(status_code=502, detail="Gemini API сейчас не ответил. Попробуй ещё раз.") from exc
+
+    # Сохраняем историю
+    _chat_history.setdefault(data.user_id, []).append({"role": "user", "parts": [data.message]})
+    _chat_history.setdefault(data.user_id, []).append({"role": "model", "parts": [ai_reply]})
+
+    # XP и стрик
+    new_xp     = add_xp(data.user_id, 10)
+    new_streak = update_streak(data.user_id)
+
+    return {
+        "reply": ai_reply,
+        "xp": new_xp,
+        "streak": new_streak,
+        "level_up": new_xp % 50 == 0,
+    }
+
+@router.post("/clear/{user_id}")
+async def clear_history(user_id: int):
+    _chat_history.pop(user_id, None)
+    return {"ok": True
+}
+
